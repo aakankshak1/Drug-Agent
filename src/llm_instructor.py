@@ -17,7 +17,7 @@ import os
 
 import numpy as np
 import pandas as pd
-from anthropic import Anthropic
+from google import genai
 from rdkit import Chem
 from rdkit.Chem import AllChem
 from sklearn.ensemble import RandomForestClassifier
@@ -25,7 +25,10 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 
-DEFAULT_MODEL = os.environ.get("DRUGAGENT_LLM_MODEL", "claude-sonnet-5")
+# Flash is free-tier eligible and plenty capable for these short,
+# structured prompts. Swap to "gemini-2.5-flash-lite" for an even
+# cheaper/faster free-tier option if you hit rate limits.
+DEFAULT_MODEL = os.environ.get("DRUGAGENT_LLM_MODEL", "gemini-2.5-flash")
 
 # Candidate column names, since HIV/PAMPA/DAVIS don't share a schema.
 SMILES_COLUMNS = ["smiles", "SMILES", "Drug"]
@@ -33,19 +36,19 @@ LABEL_COLUMNS = ["HIV_active", "Y", "label", "Label"]
 
 
 class LLMInstructor:
-    def __init__(self, model: str = DEFAULT_MODEL, client: Anthropic | None = None):
+    def __init__(self, model: str = DEFAULT_MODEL, client: "genai.Client | None" = None):
         self.model = model
-        self.client = client or Anthropic()
+        # genai.Client() reads GEMINI_API_KEY (or GOOGLE_API_KEY) from the
+        # environment automatically if api_key isn't passed explicitly.
+        self.client = client or genai.Client()
 
     def _call(self, prompt: str, max_tokens: int = 512) -> str:
-        response = self.client.messages.create(
+        response = self.client.models.generate_content(
             model=self.model,
-            max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}],
+            contents=prompt,
+            config={"max_output_tokens": max_tokens},
         )
-        return "".join(
-            block.text for block in response.content if block.type == "text"
-        )
+        return (response.text or "").strip()
 
     def check_domain_knowledge(self, dataset_name: str, idea: dict) -> str:
         """

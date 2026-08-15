@@ -11,7 +11,7 @@ It now actually:
   3. Sends the reports back to the Planner, which picks the best idea.
 
 Usage:
-    export ANTHROPIC_API_KEY=sk-...
+    export GEMINI_API_KEY=...   # free key: https://aistudio.google.com/apikey
     python src/run_agent.py --dataset HIV --k 3
 
 Note: DAVIS is a drug-target interaction dataset (drug + protein pair)
@@ -31,10 +31,11 @@ from llm_planner import LLMPlanner
 
 
 def run(dataset_name: str, k: int) -> None:
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
         sys.exit(
-            "ANTHROPIC_API_KEY is not set. Export it before running:\n"
-            "  export ANTHROPIC_API_KEY=sk-..."
+            "GEMINI_API_KEY is not set. Get a free key at "
+            "https://aistudio.google.com/apikey, then export it:\n"
+            "  export GEMINI_API_KEY=..."
         )
 
     planner = LLMPlanner()

@@ -9,15 +9,20 @@ LLM-driven planner, following DrugAgent's two-phase design
   2. Exploration: after each idea is tried by the Instructor, revise the
      idea set using the success/failure report.
 
-Requires an ANTHROPIC_API_KEY environment variable.
+Requires a GEMINI_API_KEY environment variable (free tier available at
+https://aistudio.google.com/apikey -- Flash and Flash-Lite models are
+free, no credit card required).
 """
 
 import json
 import os
 
-from anthropic import Anthropic
+from google import genai
 
-DEFAULT_MODEL = os.environ.get("DRUGAGENT_LLM_MODEL", "claude-sonnet-5")
+# Flash is free-tier eligible and plenty capable for these short,
+# structured prompts. Swap to "gemini-2.5-flash-lite" for an even
+# cheaper/faster free-tier option if you hit rate limits.
+DEFAULT_MODEL = os.environ.get("DRUGAGENT_LLM_MODEL", "gemini-2.5-flash")
 
 # What the Instructor actually knows how to execute right now.
 # Kept explicit so the Planner can't propose something the codebase
@@ -47,19 +52,19 @@ TASK_DESCRIPTIONS = {
 class LLMPlanner:
     """LLM-backed idea space manager."""
 
-    def __init__(self, model: str = DEFAULT_MODEL, client: Anthropic | None = None):
+    def __init__(self, model: str = DEFAULT_MODEL, client: "genai.Client | None" = None):
         self.model = model
-        self.client = client or Anthropic()
+        # genai.Client() reads GEMINI_API_KEY (or GOOGLE_API_KEY) from the
+        # environment automatically if api_key isn't passed explicitly.
+        self.client = client or genai.Client()
 
     def _call(self, prompt: str, max_tokens: int = 1024) -> str:
-        response = self.client.messages.create(
+        response = self.client.models.generate_content(
             model=self.model,
-            max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}],
+            contents=prompt,
+            config={"max_output_tokens": max_tokens},
         )
-        return "".join(
-            block.text for block in response.content if block.type == "text"
-        )
+        return response.text or ""
 
     def generate_ideas(self, dataset_name: str, k: int = 3) -> list[dict]:
         """Idea Generation phase: derive K candidate solution ideas."""
