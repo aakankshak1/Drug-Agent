@@ -3,3 +3,4 @@ numpy
 rdkit
 scikit-learn
 PyTDC
+anthropic
