@@ -91,7 +91,7 @@ Respond with ONLY a JSON array, no other text, in this exact format:
   {{"model": "<one of {SUPPORTED_MODELS}>", "featurization": "<one of {SUPPORTED_FEATURIZATIONS}>", "rationale": "<1-2 sentences>"}}
 ]
 """
-        raw = self._call(prompt)
+        raw = self._call(prompt,max_tokens=2048)
         ideas = self._extract_json_array(raw)
 
         # Guard against the LLM proposing something the Instructor can't run.
@@ -137,7 +137,7 @@ Pick the single best idea to submit as the final answer. Respond with
 ONLY a JSON object, no other text, in this exact format:
 {{"chosen_index": <1-based index from the list above>, "reasoning": "<1-2 sentences>"}}
 """
-        raw = self._call(prompt, max_tokens=256)
+        raw = self._call(prompt, max_tokens=1024)
         decision = self._extract_json_object(raw)
 
         idx = decision.get("chosen_index", 1) - 1
