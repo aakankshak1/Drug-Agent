@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Temporary V2 upgrade files
+/UPGRADE_MANIFEST.md
+/INSTALL_UPGRADE.md
+/docs/V2_UPGRADE_NOTES.md

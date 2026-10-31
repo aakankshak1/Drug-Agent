@@ -1,6 +1,6 @@
-pandas
-numpy
-rdkit
-scikit-learn
-PyTDC
-google-genai
+numpy>=1.24
+pandas>=2.0
+rdkit>=2024.3
+scikit-learn>=1.4
+pytdc-nextml>=1.2.0
+google-genai>=1.0
