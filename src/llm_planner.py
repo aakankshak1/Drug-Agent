@@ -1,165 +1,233 @@
-"""
-LLM Planner: manages the idea space for a drug discovery task.
+"""Gemini-backed Planner for bounded, iterative ML experiment search."""
 
-This replaces the old hardcoded if/elif PlannerAgent with a real
-LLM-driven planner, following DrugAgent's two-phase design
-(arXiv:2411.15692, Section 2 - "LLM Planner: Idea Space Management"):
-
-  1. Idea Generation: from a task description, derive K candidate ideas.
-  2. Exploration: after each idea is tried by the Instructor, revise the
-     idea set using the success/failure report.
-
-Requires a GEMINI_API_KEY environment variable (free tier available at
-https://aistudio.google.com/apikey -- Flash and Flash-Lite models are
-free, no credit card required).
-"""
+from __future__ import annotations
 
 import json
 import os
+from typing import Any
 
-from google import genai
+try:
+    from google import genai
+except ImportError:  # allows local unit tests without the optional LLM SDK
+    genai = None
 
-# Flash is free-tier eligible and plenty capable for these short,
-# structured prompts. Swap to "gemini-2.5-flash-lite" for an even
-# cheaper/faster free-tier option if you hit rate limits.
-DEFAULT_MODEL = os.environ.get("DRUGAGENT_LLM_MODEL", "gemini-2.5-flash")
+DEFAULT_MODEL = os.environ.get("DRUGAGENT_LLM_MODEL", "gemini-3.8-flash")
+SUPPORTED_MODELS = ("Random Forest", "Logistic Regression")
 
-# What the Instructor actually knows how to execute right now.
-# Kept explicit so the Planner can't propose something the codebase
-# can't run yet.
-SUPPORTED_FEATURIZATIONS = ["ECFP4_morgan"]
-SUPPORTED_MODELS = ["Random Forest", "Logistic Regression"]
+# These are the only parameter values the Instructor is allowed to execute.
+# The LLM proposes combinations; Python validates them before any training.
+MODEL_PARAMETER_SPACE = {
+    "Random Forest": {
+        "n_estimators": (200, 400),
+        "max_features": ("sqrt", 0.5),
+        "min_samples_leaf": (1, 2, 4),
+        "class_weight": ("balanced", "balanced_subsample"),
+    },
+    "Logistic Regression": {
+        "C": (0.1, 1.0, 10.0),
+        "class_weight": ("balanced", None),
+    },
+}
 
-TASK_DESCRIPTIONS = {
-    "HIV": (
-        "High-throughput screening (HTS) task: predict whether a small "
-        "molecule (given as a SMILES string) is active against HIV "
-        "replication inhibition. Binary classification."
-    ),
-    "PAMPA": (
-        "ADMET task: predict membrane permeability (PAMPA assay) of a "
-        "small molecule from its SMILES string. Binary classification "
-        "(high vs. low/moderate permeability)."
-    ),
-    "DAVIS": (
-        "Drug-target interaction (DTI) task: predict binding between a "
-        "drug (SMILES) and a protein (amino acid sequence). Binary "
-        "classification on binding affinity threshold."
-    ),
+DEFAULT_PARAMETERS = {
+    "Random Forest": {
+        "n_estimators": 200,
+        "max_features": "sqrt",
+        "min_samples_leaf": 1,
+        "class_weight": "balanced",
+    },
+    "Logistic Regression": {"C": 1.0, "class_weight": "balanced"},
 }
 
 
 class LLMPlanner:
-    """LLM-backed idea space manager."""
+    """Generate constrained experiment ideas and refine the search from feedback."""
 
-    def __init__(self, model: str = DEFAULT_MODEL, client: "genai.Client | None" = None):
+    def __init__(self, model: str = DEFAULT_MODEL, client=None):
         self.model = model
-        # genai.Client() reads GEMINI_API_KEY (or GOOGLE_API_KEY) from the
-        # environment automatically if api_key isn't passed explicitly.
-        self.client = client or genai.Client()
+        if client is not None:
+            self.client = client
+        elif genai is not None:
+            self.client = genai.Client()
+        else:
+            raise RuntimeError("google-genai is not installed. Run `pip install -r requirements.txt`.")
 
-    def _call(self, prompt: str, max_tokens: int = 1024) -> str:
+    def _call(self, prompt: str, max_tokens: int = 2048) -> str:
         response = self.client.models.generate_content(
             model=self.model,
             contents=prompt,
-            config={"max_output_tokens": max_tokens},
+            config={"max_output_tokens": max_tokens, "temperature": 0.2},
         )
-        return response.text or ""
+        return (response.text or "").strip()
 
-    def generate_ideas(self, dataset_name: str, k: int = 3) -> list[dict]:
-        """Idea Generation phase: derive K candidate solution ideas."""
+    @staticmethod
+    def _extract_json_array(raw: str) -> list[dict[str, Any]]:
+        start, end = raw.find("["), raw.rfind("]")
+        if start < 0 or end < start:
+            raise ValueError("Planner response did not contain a JSON array.")
+        parsed = json.loads(raw[start : end + 1])
+        if not isinstance(parsed, list):
+            raise ValueError("Planner JSON response must be an array.")
+        return parsed
 
-        task_description = TASK_DESCRIPTIONS.get(
-            dataset_name, f"Binary classification task on the {dataset_name} dataset."
-        )
+    @staticmethod
+    def _extract_json_object(raw: str) -> dict[str, Any]:
+        start, end = raw.find("{"), raw.rfind("}")
+        if start < 0 or end < start:
+            raise ValueError("Planner response did not contain a JSON object.")
+        parsed = json.loads(raw[start : end + 1])
+        if not isinstance(parsed, dict):
+            raise ValueError("Planner JSON response must be an object.")
+        return parsed
 
-        prompt = f"""You are the Planner agent in a drug-discovery ML pipeline.
+    @staticmethod
+    def _allowed_featurization(dataset_name: str) -> str:
+        return "ECFP4_plus_CT" if dataset_name.upper() == "DAVIS" else "ECFP4_Morgan"
 
-Task: {task_description}
+    @staticmethod
+    def _validate_idea(raw_idea: dict[str, Any], dataset_name: str) -> dict[str, Any] | None:
+        if not isinstance(raw_idea, dict):
+            return None
+        model = raw_idea.get("model")
+        if model not in SUPPORTED_MODELS:
+            return None
 
-Constraints: you may only choose a model from {SUPPORTED_MODELS} and a
-featurization from {SUPPORTED_FEATURIZATIONS} (Morgan/ECFP4 fingerprints
-on the SMILES string). Do not propose anything outside these lists.
-
-Generate {k} distinct candidate ideas for solving this task. Vary the
-model choice and briefly justify each idea using domain knowledge about
-the task (e.g. why a tree-based model might suit a sparse fingerprint
-space, or why linear models suit smaller datasets).
-
-Respond with ONLY a JSON array, no other text, in this exact format:
-[
-  {{"model": "<one of {SUPPORTED_MODELS}>", "featurization": "<one of {SUPPORTED_FEATURIZATIONS}>", "rationale": "<1-2 sentences>"}}
-]
-"""
-        raw = self._call(prompt,max_tokens=2048)
-        ideas = self._extract_json_array(raw)
-
-        # Guard against the LLM proposing something the Instructor can't run.
-        validated = []
-        for idea in ideas:
-            if idea.get("model") in SUPPORTED_MODELS and idea.get(
-                "featurization"
-            ) in SUPPORTED_FEATURIZATIONS:
-                validated.append(idea)
-
-        if not validated:
-            raise ValueError(f"Planner returned no valid ideas. Raw response: {raw!r}")
-
-        return validated[:k]
-
-    def revise_ideas(self, dataset_name: str, explored: list[dict]) -> dict:
-        """
-        Exploration phase: given ideas that have each been tried and
-        returned a success/failure report, pick the best one and explain
-        why, the way the paper's Planner selects a final submission.
-
-        `explored` is a list of dicts like:
-          {"idea": {...}, "report": {"success": bool, "accuracy": float|None, "message": str}}
-        """
-        summary_lines = []
-        for i, item in enumerate(explored):
-            idea, report = item["idea"], item["report"]
-            status = "SUCCESS" if report["success"] else "FAILURE"
-            acc = f"{report['accuracy']:.4f}" if report.get("accuracy") is not None else "N/A"
-            summary_lines.append(
-                f"{i+1}. model={idea['model']}, featurization={idea['featurization']} "
-                f"-> {status}, accuracy={acc}, note: {report['message']}"
-            )
-        summary = "\n".join(summary_lines)
-
-        prompt = f"""You are the Planner agent reviewing exploration results for the
-{dataset_name} task.
-
-Results from this round:
-{summary}
-
-Pick the single best idea to submit as the final answer. Respond with
-ONLY a JSON object, no other text, in this exact format:
-{{"chosen_index": <1-based index from the list above>, "reasoning": "<1-2 sentences>"}}
-"""
-        raw = self._call(prompt, max_tokens=1024)
-        decision = self._extract_json_object(raw)
-
-        idx = decision.get("chosen_index", 1) - 1
-        idx = max(0, min(idx, len(explored) - 1))
+        raw_params = raw_idea.get("hyperparameters", {})
+        if not isinstance(raw_params, dict):
+            return None
+        allowed = MODEL_PARAMETER_SPACE[model]
+        params = dict(DEFAULT_PARAMETERS[model])
+        for key, value in raw_params.items():
+            if key not in allowed or value not in allowed[key]:
+                return None
+            params[key] = value
 
         return {
-            "chosen": explored[idx],
-            "reasoning": decision.get("reasoning", ""),
+            "model": model,
+            "featurization": LLMPlanner._allowed_featurization(dataset_name),
+            "hyperparameters": params,
+            "rationale": str(raw_idea.get("rationale", "No rationale supplied."))[:500],
         }
 
     @staticmethod
-    def _extract_json_array(text: str) -> list[dict]:
-        text = text.strip()
-        start, end = text.find("["), text.rfind("]")
-        if start == -1 or end == -1:
-            raise ValueError(f"No JSON array found in Planner response: {text!r}")
-        return json.loads(text[start : end + 1])
+    def signature(idea: dict[str, Any]) -> str:
+        return json.dumps(
+            {"model": idea["model"], "featurization": idea["featurization"], "hyperparameters": idea["hyperparameters"]},
+            sort_keys=True,
+        )
 
-    @staticmethod
-    def _extract_json_object(text: str) -> dict:
-        text = text.strip()
-        start, end = text.find("{"), text.rfind("}")
-        if start == -1 or end == -1:
-            raise ValueError(f"No JSON object found in Planner response: {text!r}")
-        return json.loads(text[start : end + 1])
+    def _fallback_ideas(self, dataset_name: str, excluded: set[str], limit: int) -> list[dict[str, Any]]:
+        defaults = [
+            {"model": "Random Forest", "hyperparameters": {"n_estimators": 200, "max_features": "sqrt", "min_samples_leaf": 1, "class_weight": "balanced"}},
+            {"model": "Random Forest", "hyperparameters": {"n_estimators": 400, "max_features": "sqrt", "min_samples_leaf": 2, "class_weight": "balanced_subsample"}},
+            {"model": "Random Forest", "hyperparameters": {"n_estimators": 200, "max_features": 0.5, "min_samples_leaf": 4, "class_weight": "balanced"}},
+            {"model": "Logistic Regression", "hyperparameters": {"C": 0.1, "class_weight": "balanced"}},
+            {"model": "Logistic Regression", "hyperparameters": {"C": 1.0, "class_weight": "balanced"}},
+            {"model": "Logistic Regression", "hyperparameters": {"C": 10.0, "class_weight": None}},
+        ]
+        results = []
+        for item in defaults:
+            idea = self._validate_idea(item, dataset_name)
+            if idea and self.signature(idea) not in excluded:
+                idea["rationale"] = "Deterministic fallback candidate from the supported experiment space."
+                results.append(idea)
+            if len(results) >= limit:
+                break
+        return results
+
+    def generate_ideas(
+        self,
+        dataset_name: str,
+        k: int = 3,
+        feedback: list[dict[str, Any]] | None = None,
+        excluded_signatures: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Generate new candidates; use validated fallback candidates if needed."""
+        excluded = set(excluded_signatures or set())
+        model_space = json.dumps(MODEL_PARAMETER_SPACE, indent=2)
+        feedback_text = json.dumps(feedback or [], indent=2, default=str)[:7000]
+        featurization = self._allowed_featurization(dataset_name)
+        prompt = f"""You are the Planner in a drug-discovery ML experimentation system.
+
+Dataset: {dataset_name}
+Task: {dataset_name} benchmark task. The Instructor uses {featurization} featurization.
+Supported model/parameter space (do not invent any value):
+{model_space}
+
+Previously tested candidates to avoid:
+{json.dumps(sorted(excluded), indent=2)}
+
+Experimental feedback from previous rounds:
+{feedback_text}
+
+Generate up to {k} DISTINCT new candidate configurations. Use the feedback to
+explore alternatives to weak candidates and refine promising ones. Return ONLY
+valid JSON, with this exact structure:
+[
+  {{"model":"Random Forest","hyperparameters":{{"n_estimators":200,"max_features":"sqrt","min_samples_leaf":1,"class_weight":"balanced"}},"rationale":"..."}}
+]
+Every parameter value must be selected from the supported space. Do not generate
+code, make up metrics, or suggest unimplemented featurization methods.
+"""
+        candidates = []
+        try:
+            raw = self._call(prompt, max_tokens=2048)
+            raw_ideas = self._extract_json_array(raw)
+        except Exception:
+            raw_ideas = []
+
+        seen = set(excluded)
+        for raw_idea in raw_ideas:
+            idea = self._validate_idea(raw_idea, dataset_name)
+            if not idea:
+                continue
+            key = self.signature(idea)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(idea)
+            if len(candidates) >= k:
+                break
+
+        if len(candidates) < k:
+            candidates.extend(self._fallback_ideas(dataset_name, seen, k - len(candidates)))
+        return candidates
+
+    def revise_ideas(self, explored: list[dict[str, Any]]) -> dict[str, Any]:
+        """Choose from validation results and ask Gemini for a concise explanation.
+
+        The numeric selection is guarded: an LLM response cannot select a failed
+        candidate or override a measurably better validation ROC-AUC.
+        """
+        valid = [
+            item for item in explored
+            if item.get("report", {}).get("success")
+            and item["report"].get("validation_roc_auc") is not None
+        ]
+        if not valid:
+            raise RuntimeError("No candidate completed validation successfully.")
+        best = max(valid, key=lambda item: item["report"]["validation_roc_auc"])
+        summary = [
+            {
+                "index": index + 1,
+                "model": item["idea"]["model"],
+                "hyperparameters": item["idea"]["hyperparameters"],
+                "validation_roc_auc": item["report"]["validation_roc_auc"],
+                "success": item["report"]["success"],
+                "message": item["report"].get("message", ""),
+            }
+            for index, item in enumerate(explored)
+        ]
+        prompt = f"""Review these drug-discovery ML experiments:
+{json.dumps(summary, indent=2)}
+
+The candidate with the highest validation ROC-AUC is index
+{explored.index(best) + 1}. Explain in 1-3 concise sentences why that candidate
+is the strongest validation choice. Do not invent results or refer to test data.
+Return JSON only: {{"reasoning":"..."}}.
+"""
+        try:
+            reasoning = self._extract_json_object(self._call(prompt, max_tokens=512)).get("reasoning", "")
+        except Exception:
+            reasoning = "Selected the successful candidate with the highest validation ROC-AUC."
+        return {"chosen": best, "reasoning": str(reasoning)[:1000]}
